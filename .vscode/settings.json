@@ -1,0 +1,8 @@
+{
+  "python.defaultInterpreterPath": "D:\\rag-system\\backend\\venv\\Scripts\\python.exe",
+  "python.analysis.extraPaths": [
+    "D:\\rag-system\\backend\\venv\\Lib\\site-packages"
+  ],
+  "python.analysis.venvPath": "D:\\rag-system\\backend",
+  "python.analysis.venv": "venv"
+}
