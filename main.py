@@ -5,6 +5,7 @@ import logging
 import os
 import json
 import tempfile
+import unicodedata
 from typing import Any
 
 from dotenv import load_dotenv
@@ -49,6 +50,10 @@ SYSTEM_PROMPT = (
     "Answer employee HR policy questions clearly using the policy documents. "
     "If the user asks about academic dates or calendars, say you will check live sources. "
     "If the answer is not in the documents, say you don't have it and ask what else you can help with."
+)
+TRANSCRIBE_PROMPT = (
+    "Transcribe the audio in English or Roman Urdu using Latin letters only. "
+    "Do not use Urdu/Hindi script."
 )
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 QDRANT_URL = os.getenv("QDRANT_URL")
@@ -381,6 +386,28 @@ def build_openai_messages(
     return messages
 
 
+def _is_garbage_transcription(text: str) -> bool:
+    """Detect Whisper hallucinations (e.g. rows of commas) on silence or bad audio."""
+    if not text:
+        return True
+    s = text.strip()
+    if not s:
+        return True
+    letters = sum(1 for c in s if c.isalpha())
+    if letters == 0 and len(s) >= 6:
+        return True
+    if letters < 2 and len(s) >= 8:
+        return True
+    punct_or_space = sum(
+        1
+        for c in s
+        if c.isspace() or unicodedata.category(c).startswith("P")
+    )
+    if len(s) >= 8 and punct_or_space / len(s) >= 0.82:
+        return True
+    return False
+
+
 def transcribe_audio(audio_bytes: bytes, filename: str | None) -> str:
     audio_file = io.BytesIO(audio_bytes)
     audio_file.name = filename or "audio.webm"
@@ -388,8 +415,19 @@ def transcribe_audio(audio_bytes: bytes, filename: str | None) -> str:
         transcription = openai_client.audio.transcriptions.create(
             model=WHISPER_MODEL,
             file=audio_file,
+            prompt=TRANSCRIBE_PROMPT,
+            temperature=0,
         )
-        return transcription.text
+        text = transcription.text.strip()
+        if any(ord(ch) > 127 for ch in text):
+            text = romanize_text(text)
+        if _is_garbage_transcription(text):
+            raise ValueError(
+                "Could not understand the audio. Please speak a bit louder and try again."
+            )
+        return text
+    except ValueError:
+        raise
     except Exception as exc:
         raise RuntimeError("Failed to transcribe audio.") from exc
 
@@ -408,6 +446,29 @@ def synthesize_audio(text: str) -> str:
         raise RuntimeError("Failed to generate TTS audio.") from exc
 
 
+def romanize_text(text: str) -> str:
+    try:
+        completion = openai_client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Convert the text to English or Roman Urdu using Latin letters only. "
+                        "Do not use Urdu/Hindi script. Return only the converted text."
+                    ),
+                },
+                {"role": "user", "content": text},
+            ],
+            temperature=0,
+            max_tokens=200,
+        )
+        converted = completion.choices[0].message.content.strip()
+        return converted or text
+    except Exception:
+        return text
+
+
 @app.post("/api/v1/ask")
 async def ask(
     request: Request,
@@ -421,9 +482,12 @@ async def ask(
             audio_bytes = await audio.read()
             if not audio_bytes:
                 raise HTTPException(status_code=400, detail="Audio file is empty.")
-            query = await anyio.to_thread.run_sync(
-                transcribe_audio, audio_bytes, audio.filename
-            )
+            try:
+                query = await anyio.to_thread.run_sync(
+                    transcribe_audio, audio_bytes, audio.filename
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
             audio_used = True
         elif text_payload and text_payload.text:
             query = text_payload.text.strip()
