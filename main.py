@@ -42,7 +42,8 @@ SYSTEM_PROMPT = (
     "If the user writes in English, reply in English. "
     "If the user mixes, reply in a light mix. "
     "Be funny, friendly, and concise. "
-    "Avoid repetitive closings like 'How can I assist you today?' and only ask a follow-up if needed. "
+    "Avoid repetitive closings and never say 'How can I help you today?'. "
+    "Only ask a follow-up if needed. "
     "Answer employee HR policy questions clearly using the policy documents. "
     "If the user asks about academic dates or calendars, say you will check live sources. "
     "If the answer is not in the documents, say you don't have it and ask what else you can help with."
@@ -408,6 +409,7 @@ async def ask(
     x_session_id: str | None = Header(default=None),
 ):
     try:
+        audio_used = False
         if audio is not None:
             audio_bytes = await audio.read()
             if not audio_bytes:
@@ -415,6 +417,7 @@ async def ask(
             query = await anyio.to_thread.run_sync(
                 transcribe_audio, audio_bytes, audio.filename
             )
+            audio_used = True
         elif text_payload and text_payload.text:
             query = text_payload.text.strip()
         else:
@@ -473,6 +476,7 @@ async def ask(
             "answer": answer,
             "audio_base64": audio_base64,
             "sources": sources,
+            "transcript": query if audio_used else None,
         }
     except HTTPException:
         raise
@@ -595,7 +599,15 @@ async def ask_stream(
         finally:
             LANGUAGE_CTX.reset(language_token)
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/api/v1/upload-policy")
