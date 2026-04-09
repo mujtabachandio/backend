@@ -627,6 +627,15 @@ async def ask_stream(
     )
 
 
+@app.post("/api/v1/reset")
+async def reset_chat(x_session_id: str | None = Header(default=None)):
+    session_id = x_session_id or "default"
+    memory = SESSION_MEMORY.pop(session_id, None)
+    if memory:
+        await memory.areset()
+    return {"status": "success"}
+
+
 @app.post("/api/v1/upload-policy")
 async def upload_policy(
     version: str = Form(default="current"),
