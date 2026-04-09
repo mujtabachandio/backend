@@ -136,10 +136,12 @@ SESSION_MEMORY: dict[str, ChatMemoryBuffer] = {}
 LANGUAGE_CTX = contextvars.ContextVar("language", default="english")
 META_SYSTEM_PROMPT = (
     "Classify the user's request. Return ONLY valid JSON with keys "
-    "`intent` and `language`.\n\n"
+    "`intent`, `language`, and `reply`.\n\n"
     "intent must be one of: policy_question, list_policies, live_dates, other.\n"
     "language must be one of: english, roman, mixed (roman = Urdu in English letters).\n"
-    "Example: {\"intent\":\"policy_question\",\"language\":\"roman\"}"
+    "reply is required only when intent=other; otherwise reply must be an empty string.\n"
+    "If intent=other, make reply short, friendly, and in the user's language.\n"
+    "Example: {\"intent\":\"other\",\"language\":\"english\",\"reply\":\"Hey! How can I help?\"}"
 )
 NAME_SYSTEM_PROMPT = (
     "Extract the user's name if they shared it. Return ONLY valid JSON with key "
@@ -278,7 +280,7 @@ def extract_sources(source_nodes: list[Any]) -> list[dict[str, Any]]:
     return results
 
 
-def classify_meta_llm(query: str) -> tuple[str, str]:
+def classify_meta_llm(query: str) -> tuple[str, str, str]:
     try:
         completion = openai_client.chat.completions.create(
             model=LLM_MODEL,
@@ -287,20 +289,23 @@ def classify_meta_llm(query: str) -> tuple[str, str]:
                 {"role": "user", "content": query},
             ],
             temperature=0,
-            max_tokens=24,
+            max_tokens=48,
             response_format={"type": "json_object"},
         )
         payload = completion.choices[0].message.content.strip()
         data = json.loads(payload)
         intent = str(data.get("intent", "")).lower()
         language = str(data.get("language", "")).lower()
+        reply = str(data.get("reply", "")).strip()
         if intent not in {"policy_question", "list_policies", "live_dates", "other"}:
             intent = "policy_question"
         if language not in {"english", "roman", "mixed"}:
             language = "english"
-        return intent, language
+        if intent != "other":
+            reply = ""
+        return intent, language, reply
     except Exception:
-        return "policy_question", "english"
+        return "policy_question", "english", ""
 
 
 def chunk_text(text: str, size: int = 80) -> list[str]:
@@ -441,10 +446,15 @@ async def ask(
         if not known_name and extracted_name:
             remember_user_name(memory, extracted_name)
             known_name = extracted_name
-        intent, language = await anyio.to_thread.run_sync(classify_meta_llm, query)
+        intent, language, reply = await anyio.to_thread.run_sync(
+            classify_meta_llm, query
+        )
         language_token = LANGUAGE_CTX.set(language)
         try:
-            if intent == "list_policies":
+            if intent == "other" and reply:
+                answer = reply
+                sources = []
+            elif intent == "list_policies":
                 answer = list_policies_tool()
                 sources = []
             elif intent == "live_dates":
@@ -518,14 +528,21 @@ async def ask_stream(
     if not known_name and extracted_name:
         remember_user_name(memory, extracted_name)
         known_name = extracted_name
-    intent, language = await anyio.to_thread.run_sync(classify_meta_llm, query)
+    intent, language, reply = await anyio.to_thread.run_sync(
+        classify_meta_llm, query
+    )
 
     async def event_stream():
         answer_parts: list[str] = []
         sources: list[dict[str, Any]] = []
         language_token = LANGUAGE_CTX.set(language)
         try:
-            if intent == "list_policies":
+            if intent == "other" and reply:
+                answer = reply
+                for chunk in chunk_text(answer):
+                    answer_parts.append(chunk)
+                    yield f"data: {json.dumps({'type': 'chunk', 'text': chunk}, ensure_ascii=False)}\n\n"
+            elif intent == "list_policies":
                 answer = list_policies_tool()
                 for chunk in chunk_text(answer):
                     answer_parts.append(chunk)
